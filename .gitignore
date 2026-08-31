@@ -1,0 +1,8 @@
+# never publish device-unique data: IMEI, EFS, calibration
+*.img
+*.bin
+*.elf
+*.mbn
+backup/
+odin/
+*.tar.md5

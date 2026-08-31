@@ -1,0 +1,320 @@
+--- a/samloader/auth.py
++++ b/samloader/auth.py
+@@ -1,15 +1,26 @@
+ # SPDX-License-Identifier: GPL-3.0+
+ # Copyright (C) 2020 nlscc
+ 
+-""" FUS authentication functions (decrypting nonce, calculating auth token) """
++""" FUS authentication functions (calculating auth token).
++
++2026 FUS scheme change: the server NONCE header is no longer encrypted, and the
++signature is a fixed-key AES-128-ECB block over the nonce, hex-encoded (was:
++CBC with a nonce-derived key, base64). Scheme taken from SamFirm_Reborn
++KiesAuth.cs. KEY_1/KEY_2/derive_key are dead under the new scheme but kept so
++older captures stay decodable.
++"""
+ 
+ import base64
+ from Cryptodome.Cipher import AES
+ 
+-# Constant key input values.
++# Legacy constant key input values (pre-2026 scheme).
+ KEY_1 = "hqzdurufm2c8mf6bsjezu1qgveouv7c7"
+ KEY_2 = "w13r4cvf4hctaujv"
+ 
++# Current fixed AES-128-ECB signature key.
++AUTH_AES_KEY = bytes([0x42, 0x2e, 0x73, 0x73, 0x36, 0x17, 0xae, 0x2b,
++                      0x19, 0x89, 0x40, 0xfd, 0x4e, 0x32, 0xb0, 0xa5])
++
+ # PKCS#7 padding functions.
+ pkcs_unpad = lambda d: d[:-d[-1]]
+ pkcs_pad = lambda d: d + bytes([16 - (len(d) % 16)]) * (16 - (len(d) % 16))
+@@ -27,23 +38,26 @@
+     return pkcs_unpad(cipher.decrypt(inp))
+ 
+ def derive_key(nonce: str) -> bytes:
+-    """ Calculate the AES key from the FUS input nonce. """
++    """ Legacy: calculate the AES key from the FUS input nonce. """
+     key = ""
+-    # First 16 bytes are offsets into KEY_1
+     for i in range(16):
+         key += KEY_1[ord(nonce[i]) % 16]
+-    # Last 16 bytes are static
+     key += KEY_2
+     return key.encode()
+ 
+ def getauth(nonce: str) -> str:
+-    """ Calculate the response token from a given nonce. """
+-    nkey = derive_key(nonce)
+-    auth_data = aes_encrypt(nonce.encode(), nkey)
+-    return base64.b64encode(auth_data).decode()
++    """ Calculate the response token from a given nonce.
++
++    One 16-byte block of ASCII zeroes with the nonce copied over the front,
++    AES-128-ECB encrypted (no padding), lowercase hex.
++    """
++    block = bytearray(b"0" * 16)
++    ndata = nonce.encode("ascii")
++    count = min(len(ndata), 16)
++    block[0:count] = ndata[0:count]
++    cipher = AES.new(AUTH_AES_KEY, AES.MODE_ECB)
++    return cipher.encrypt(bytes(block)).hex()
+ 
+ def decryptnonce(inp: str) -> str:
+-    """ Decrypt the nonce returned by the server. """
+-    inp_data = base64.b64decode(inp)
+-    nonce = aes_decrypt(inp_data, KEY_1.encode()).decode()
+-    return nonce
++    """ The server nonce is now sent in plaintext. """
++    return inp
+--- a/samloader/request.py
++++ b/samloader/request.py
+@@ -1,7 +1,12 @@
+ # SPDX-License-Identifier: GPL-3.0+
+ # Copyright (C) 2020 nlscc
+ 
+-""" Build FUS XML requests. """
++""" Build FUS XML requests.
++
++2026: FUS moved to the "Smart" endpoints, which want BINARY_* field names,
++REQUEST_TYPE and CmdID, and a SessionID/MsgID in the header. Field layout
++taken from SamFirm_Reborn Xml.cs (LatestVer / BinaryInit templates).
++"""
+ 
+ import xml.etree.ElementTree as ET
+ 
+@@ -18,6 +23,8 @@
+     """ Build the FUSHdr of an XML message. """
+     fushdr = ET.SubElement(fusmsg, "FUSHdr")
+     ET.SubElement(fushdr, "ProtoVer").text = "1.0"
++    ET.SubElement(fushdr, "SessionID").text = "0"
++    ET.SubElement(fushdr, "MsgID").text = "1"
+ 
+ def build_reqbody(fusmsg: ET.Element, params: dict):
+     """ Build the FUSBody of an XML message. """
+@@ -27,29 +34,42 @@
+         setag = ET.SubElement(fput, tag)
+         sedata = ET.SubElement(setag, "Data")
+         sedata.text = str(value)
++    return fusbody, fput
+ 
+ def binaryinform(fwv: str, model: str, region: str, nonce: str) -> str:
+     """ Build a BinaryInform request. """
+     fusmsg = ET.Element("FUSMsg")
+     build_reqhdr(fusmsg)
+-    build_reqbody(fusmsg, {
+-        "ACCESS_MODE": 2,
++    fusbody, fput = build_reqbody(fusmsg, {
++        "ACCESS_MODE": 1,
+         "BINARY_NATURE": 1,
+-        "CLIENT_PRODUCT": "Smart Switch",
+-        "DEVICE_FW_VERSION": fwv,
+-        "DEVICE_LOCAL_CODE": region,
+-        "DEVICE_MODEL_NAME": model,
+-        "LOGIC_CHECK": getlogiccheck(fwv, nonce)
++        "REQUEST_TYPE": 2,
++        "LOGIC_CHECK": getlogiccheck(fwv, nonce),
++        "BINARY_SW_VERSION": fwv,
++        "BINARY_LOCAL_CODE": region,
++        "BINARY_MODEL_NAME": model,
+     })
++    # CmdID is a bare element on Put, not wrapped in <Data>.
++    fput.insert(0, ET.Element("CmdID"))
++    fput[0].text = "1"
++    fget = ET.SubElement(fusbody, "Get")
++    ET.SubElement(fget, "CmdID").text = "2"
++    ET.SubElement(fget, "BINARY_SW_VERSION")
+     return ET.tostring(fusmsg)
+ 
+-def binaryinit(filename: str, nonce: str) -> str:
++def binaryinit(filename: str, version: str, region: str, model_type: str, nonce: str) -> str:
+     """ Build a BinaryInit request. """
+     fusmsg = ET.Element("FUSMsg")
+     build_reqhdr(fusmsg)
+-    checkinp = filename.split(".")[0][-16:]
++    if filename.endswith((".zip.enc2", ".zip.enc4")) and len(filename) >= 25:
++        checkinp = filename[-25:-9]
++    else:
++        checkinp = filename.split(".")[0][-16:]
+     build_reqbody(fusmsg, {
+-        "BINARY_FILE_NAME": filename,
+-        "LOGIC_CHECK": getlogiccheck(checkinp, nonce)
++        "BINARY_NAME": filename,
++        "BINARY_SW_VERSION": version,
++        "DEVICE_LOCAL_CODE": region,
++        "DEVICE_MODEL_TYPE": model_type,
++        "LOGIC_CHECK": getlogiccheck(checkinp, nonce),
+     })
+     return ET.tostring(fusmsg)
+--- a/samloader/main.py
++++ b/samloader/main.py
+@@ -34,7 +34,7 @@
+     args = parser.parse_args()
+     if args.command == "download":
+         client = fusclient.FUSClient()
+-        path, filename, size = getbinaryfile(client, args.fw_ver, args.dev_model, args.dev_region)
++        path, filename, size, model_type = getbinaryfile(client, args.fw_ver, args.dev_model, args.dev_region)
+         print("resuming" if args.resume else "downloading", filename)
+         out = args.out_file if args.out_file else os.path.join(args.out_dir, filename)
+         dloffset = os.stat(out).st_size if args.resume else 0
+@@ -42,7 +42,7 @@
+             print("already downloaded!")
+             return
+         fd = open(out, "ab" if args.resume else "wb")
+-        initdownload(client, filename)
++        initdownload(client, filename, args.fw_ver, args.dev_region, model_type)
+         r = client.downloadfile(path+filename, dloffset)
+         if args.show_md5 and "Content-MD5" in r.headers:
+             print("MD5:", base64.b64decode(r.headers["Content-MD5"]).hex())
+@@ -77,20 +77,29 @@
+             with open(args.out_file, "wb") as outf:
+                 crypt.decrypt_progress(inf, outf, key, length)
+ 
+-def initdownload(client, filename):
+-    req = request.binaryinit(filename, client.nonce)
+-    resp = client.makereq("NF_DownloadBinaryInitForMass.do", req)
++def initdownload(client, filename, version, region, model_type):
++    req = request.binaryinit(filename, version, region, model_type, client.nonce)
++    resp = client.makereq("NF_SmartDownloadBinaryInitForMass.do", req)
+ 
+ def getbinaryfile(client, fw, model, region):
+     req = request.binaryinform(fw, model, region, client.nonce)
+-    resp = client.makereq("NF_DownloadBinaryInform.do", req)
++    resp = client.makereq("NF_SmartDownloadBinaryInform.do", req)
+     root = ET.fromstring(resp)
+-    status = int(root.find("./FUSBody/Results/Status").text)
++    status_text = root.find("./FUSBody/Results/Status").text
++    # FUS now answers S00 for success instead of 200.
++    status = 200 if status_text == "S00" else int(status_text)
+     if status != 200:
+         raise Exception("DownloadBinaryInform returned {}, firmware could not be found?".format(status))
+     filename = root.find("./FUSBody/Put/BINARY_NAME/Data").text
+     if filename is None:
+         raise Exception("DownloadBinaryInform failed to find a firmware bundle")
+-    size = int(root.find("./FUSBody/Put/BINARY_BYTE_SIZE/Data").text)
+-    path = root.find("./FUSBody/Put/MODEL_PATH/Data").text
+-    return path, filename, size
++    def first(*paths):
++        for pth in paths:
++            el = root.find(pth)
++            if el is not None and el.text:
++                return el.text
++        raise Exception("DownloadBinaryInform missing all of: " + ", ".join(paths))
++    size = int(first("./FUSBody/Put/BINARY_BYTE_SIZE/Data", "./FUSBody/Put/BINARY_SIZE/Data", "./FUSBody/Results/BINARY_BYTE_SIZE/Data"))
++    path = first("./FUSBody/Put/MODEL_PATH/Data", "./FUSBody/Put/BINARY_PATH/Data")
++    model_type = first("./FUSBody/Put/DEVICE_MODEL_TYPE/Data", "./FUSBody/Put/BINARY_MODEL_TYPE/Data")
++    return path, filename, size, model_type
+--- a/samloader/fusclient.py
++++ b/samloader/fusclient.py
+@@ -1,7 +1,15 @@
+ # SPDX-License-Identifier: GPL-3.0+
+ # Copyright (C) 2020 nlscc
+ 
+-""" FUS request helper (automatically sign requests and update tokens) """
++""" FUS request helper (automatically sign requests and update tokens)
++
++2026 FUS changes:
++  - endpoints moved to NF_Smart*, cloud host to cloud-neofussvr.samsungmobile.com
++  - User-Agent must be "SMART 2.0" (was "Kies2.0_FUS")
++  - the server nonce is echoed back in every request, not just the download
++  - the session is carried by a SESSION cookie, not JSESSIONID; the whole
++    exchange must share one cookie jar or BinaryInform answers 401
++"""
+ 
+ import requests
+ 
+@@ -9,35 +17,42 @@
+ 
+ class FUSClient:
+     """ FUS API client. """
++    BASE = "https://neofussvr.sslcs.cdngc.net/"
++    CLOUD = "http://cloud-neofussvr.samsungmobile.com/NF_SmartDownloadBinaryForMass.do"
++    UA = "SMART 2.0"
++
+     def __init__(self):
+         self.auth = ""
+-        self.sessid = ""
+-        self.makereq("NF_DownloadGenerateNonce.do") # initialize nonce
+-    def makereq(self, path: str, data: str = "") -> str:
+-        """ Make a FUS request to a given endpoint. """
+-        authv = 'FUS nonce="", signature="' + self.auth + '", nc="", type="", realm="", newauth="1"'
+-        req = requests.post("https://neofussvr.sslcs.cdngc.net/" + path, data=data,
+-                            headers={"Authorization": authv, "User-Agent": "Kies2.0_FUS"},
+-                            cookies={"JSESSIONID": self.sessid})
+-        # If a new NONCE is present, decrypt it and update our auth token.
++        self.encnonce = ""
++        self.nonce = ""
++        self.session = requests.Session()
++        self.makereq("NF_SmartDownloadGenerateNonce.do")  # initialize nonce
++
++    def _headers(self) -> dict:
++        return {"Authorization": 'FUS nonce="' + self.encnonce + '", signature="'
++                                 + self.auth + '", nc="", type="", realm="", newauth="1"',
++                "User-Agent": self.UA,
++                "Cache-Control": "no-cache"}
++
++    def _updatenonce(self, req):
+         if "NONCE" in req.headers:
+             self.encnonce = req.headers["NONCE"]
+             self.nonce = auth.decryptnonce(self.encnonce)
+             self.auth = auth.getauth(self.nonce)
+-        # Update the session cookie if needed.
+-        if "JSESSIONID" in req.cookies:
+-            self.sessid = req.cookies["JSESSIONID"]
++
++    def makereq(self, path: str, data: str = "") -> str:
++        """ Make a FUS request to a given endpoint. """
++        req = self.session.post(self.BASE + path, data=data, headers=self._headers())
++        self._updatenonce(req)
+         req.raise_for_status()
+         return req.text
++
+     def downloadfile(self, filename: str, start: int = 0) -> requests.Response:
+         """ Make a FUS cloud request to download a given file. """
+-        # In a cloud request, we also need to pass the server nonce.
+-        authv = 'FUS nonce="' + self.encnonce + '", signature="' + self.auth \
+-            + '", nc="", type="", realm="", newauth="1"'
+-        headers = {"Authorization": authv, "User-Agent": "Kies2.0_FUS"}
++        headers = self._headers()
+         if start > 0:
+             headers["Range"] = "bytes={}-".format(start)
+-        req = requests.get("http://cloud-neofussvr.sslcs.cdngc.net/NF_DownloadBinaryForMass.do",
+-                           params="file=" + filename, headers=headers, stream=True)
++        req = self.session.get(self.CLOUD, params="file=" + filename,
++                               headers=headers, stream=True)
+         req.raise_for_status()
+         return req
+--- a/samloader/crypt.py
++++ b/samloader/crypt.py
+@@ -16,13 +16,28 @@
+ unpad = lambda d: d[:-d[-1]]
+ 
+ def getv4key(version, model, region):
+-    """ Retrieve the AES key for V4 encryption. """
++    """ Retrieve the AES key for V4 encryption.
++
++    2026: FUS dropped Results/LATEST_FW_VERSION; the same string now comes back
++    as Results/BINARY_SW_VERSION. Key derivation itself is unchanged --
++    md5(logiccheck(version, LOGIC_VALUE_FACTORY)), per SamFirm_Reborn
++    Crypto.SetDecryptKey(version, LogicValue).
++    """
+     client = fusclient.FUSClient()
+     version = versionfetch.normalizevercode(version)
+     req = request.binaryinform(version, model, region, client.nonce)
+-    resp = client.makereq("NF_DownloadBinaryInform.do", req)
++    resp = client.makereq("NF_SmartDownloadBinaryInform.do", req)
+     root = ET.fromstring(resp)
+-    fwver = root.find("./FUSBody/Results/LATEST_FW_VERSION/Data").text
++    fwver = None
++    for path in ("./FUSBody/Results/LATEST_FW_VERSION/Data",
++                 "./FUSBody/Results/BINARY_SW_VERSION/Data",
++                 "./FUSBody/Put/BINARY_SW_VERSION/Data"):
++        el = root.find(path)
++        if el is not None and el.text:
++            fwver = el.text
++            break
++    if fwver is None:
++        fwver = version
+     logicval = root.find("./FUSBody/Put/LOGIC_VALUE_FACTORY/Data").text
+     deckey = request.getlogiccheck(fwver, logicval)
+     return hashlib.md5(deckey.encode()).digest()
