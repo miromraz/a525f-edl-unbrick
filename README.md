@@ -163,3 +163,9 @@ status is `S00`, not `200`.
 This worked on my device. EDL writes can permanently brick a phone. Back up
 `modemst1`/`modemst2`/`efs`/`persist` before writing anything — those carry your IMEI and
 radio calibration and cannot be replaced. No dumps are included in this repo for that reason.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE). `patches/samloader-fus-2026.patch` is a patch
+against [samloader](https://github.com/nlscc/samloader) and carries that project's
+GPL-3.0-or-later licensing.
